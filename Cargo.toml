@@ -1,0 +1,27 @@
+[package]
+name = "ainav"
+version = "0.1.0"
+authors = ["Michael Sloan <mgsloan@gmail.com>"]
+
+[dependencies]
+enigo = "0.0.10"
+captrs = "0.2.2"
+# image = "0.15.0"
+image = { path = "../../oss/PistonDevelopers/image" }
+bit-vec = "0.4.4"
+freetype-rs = "0.14.0"
+log = "0.3.8"
+x11 = { version = "2.15.0", features = ["xinerama", "xlib"] }
+# x11 = { path = "x11-rs/x11", features = ["xinerama", "xlib"] }
+libc = "0.2.30"
+
+# fontconfig = { path = "fontconfig-rs" }
+# fontconfig-sys = { path = "fontconfig-rs/fontconfig-sys" }
+
+
+# arrayfire = "3.5.0"
+# freetype = "0.3.0"
+
+# servo-fontconfig = "0.4.0"
+# libc = "0.2.30"
+# fxhash = "0.2.1"
