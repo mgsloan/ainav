@@ -1,81 +1,79 @@
-#![allow(non_upper_case_globals)]
+// NOTE: no doubt much more required.
+//
+// sudo apt-get install libxcb-keysyms1-dev
 
-// TODO: Is it possible to avoid copying screen to a buffer? I.e. raw access?
-// Seems like this might be possible if using a screen buffer, but not with GPU.
-
-// TODO: When entering into the keypress mode, do as much pre-processing as
-// possible (grayscaling, text region detection). Like byzanz, use XDamage
-// https://www.freedesktop.org/wiki/Software/XDamage/ to invalidate parts of
-// this cache.  captrs can't do partial screeen capture though..
-
-extern crate bit_vec;
-extern crate captrs;
-extern crate enigo;
-extern crate image;
-extern crate freetype;
-extern crate log;
+extern crate xcb;
 extern crate x11;
 extern crate libc;
+extern crate xcb_util;
+extern crate image;
 
-use std::convert::From;
-use std::ptr::null_mut;
-use captrs::*;
-use enigo::*;
+mod xcb_extras;
+
+use x11::{xlib, xrandr};
+use xcb::*;
+use xcb_extras::*;
+use xcb_util::keysyms::KeySymbols;
+use xcb_util::image::shm;
+use std::{slice, ptr};
 use image::*;
-use std::mem;
 use std::path::Path;
-use std::time;
-use std::thread;
-use freetype::{face};
-use bit_vec::*;
-use libc::{malloc};
-use x11::xlib::*;
-use std::ffi::CStr;
-use screen::*;
+use std::vec::Vec;
 
-mod images;
-mod glyph;
-mod screen;
-mod keyboard;
+// TODO: Defer some x11 response checking.
 
-// TODO: x11cap (via captrs) also calls XOpenDisplay. Not so pretty.
-// https://github.com/bryal/X11Cap/issues/4
+// TODO: Update cur_screen
 
-#[derive(Debug)]
-pub struct State {
-    pub displays: DisplayInfo,
+// FIXME: from_raw_parts usage is totally broken in xcb library. Stuff never
+// gets deallocated!  Same for usage in xcb_util::image
+
+struct State<'a> {
+    pub dpy: *mut xlib::Display,
+    pub conn: &'a Connection,
+    pub cur_screen: Screen<'a>,
+    pub keysyms: KeySymbols<'a>,
+    pub window: Window,
 }
 
 fn main() {
-    // TODO: Instead require and pass in value of DISPLAY environment
-    // variable, like in keynav?
+    let dpy = unsafe { xlib::XOpenDisplay(ptr::null_mut()) };
+    let conn = unsafe { Connection::new_from_xlib_display(dpy) };
+    let setup = conn.get_setup();
+    let mut cur_screen = None;
+    for screen in setup.roots() {
+        // Ctrl+Space
+        check(dpy, grab_key_checked(&conn, false, screen.root(), MOD_MASK_CONTROL, 65, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC));
+        cur_screen = Some(screen);
+    }
+    let window = conn.generate_id();
     let state = State {
-        displays: get_display_info()
+        dpy,
+        conn: &conn,
+        cur_screen: cur_screen.unwrap(),
+        keysyms: KeySymbols::new(&conn),
+        window
     };
-    let dpy = state.displays.dpy;
-
-    for screen in &state.displays.screens {
-        let keycode = 47;
-        let mods = ControlMask;
-        println!("{} {} {}", keycode, mods, screen.root);
-        unsafe {
-            XGrabKey(dpy, keycode, mods, screen.root, false as i32, GrabModeAsync, GrabModeAsync);
-        }
-    }
-
-    unsafe {
-        XSync(dpy, false as i32);
-    }
-
-    let mut event = XEvent { pad: [0;24] };
+    let (x, y, width, height) = get_screen_dims(&state);
+    let values = [
+        (CW_OVERRIDE_REDIRECT as u32, 1u32)
+    ];
+    check(dpy, create_window_checked(
+        &conn,
+        24,
+        window,
+        state.cur_screen.root(),
+        x as i16, y as i16, width as u16, height as u16, 0,
+        WINDOW_CLASS_INPUT_OUTPUT as u16,
+        state.cur_screen.root_visual(),
+        &values));
+    // let img = screenshot(&state);
     loop {
-        // TODO: what is the int that this returns?
-        let _ = unsafe { XNextEvent(dpy, &mut event) };
-        match event.get_type() {
-            KeyPress => {
-                let key_event: XKeyEvent = From::from(event);
-                println!("Key press received {}", key_event.keycode);
-                if key_event.keycode == 47 {
+        let event = state.conn.wait_for_event().expect("IO error while waiting for key event");
+        match event.response_type() {
+            KEY_PRESS => {
+                let key_press: &KeyPressEvent = unsafe { cast_event(&event) };
+                println!("Key pressed: {}", key_press.detail());
+                if key_press.detail() == 65 {
                     start(&state);
                 }
             }
@@ -85,153 +83,136 @@ fn main() {
     }
 }
 
-fn start(state: &State) {
-    // FIXME: Avoid recomputation. Need to learn borrow stuff.
-    let dpy = state.displays.dpy;
-    // let displays = screen::get_displays(dpy);
-    keyboard::grab_keyboard(&state.displays);
-    // TODO: what is the int that this returns?
-    let mut event = XEvent { pad: [0;24] };
+fn start (state: &State) {
+    check(state.dpy, map_window_checked(state.conn, state.window));
+    check(state.dpy, grab_keyboard(state.conn, false, state.cur_screen.root(), CURRENT_TIME, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC));
     loop {
-        let _ = unsafe { XNextEvent(dpy, &mut event) };
-        match event.get_type() {
-            KeyPress => {
-                let key_event: XKeyEvent = From::from(event);
-                let index = if key_event.state & 0x2000 != 0 { 2 } else { 0 } /* ISO Level3 Shift */
-                          + if key_event.state & ShiftMask != 0 { 1 } else { 0 };
-                // FIXME: Is the cast symptomatic of a bug?
-                let str = unsafe {
-                    let sym = XkbKeycodeToKeysym(dpy, key_event.keycode as u8, 0, index);
-                    let raw_str = XKeysymToString(sym);
-                    CStr::from_ptr(raw_str)
-                };
-                println!("{:?}", str);
-                unsafe { XUngrabKeyboard(dpy, CurrentTime); }
-                let character = str.to_bytes_with_nul()[0] as usize;
-                let results = find_chars_list(character);
+        let event = state.conn.wait_for_event().expect("IO error while waiting for key event");
+        match event.response_type() {
+            KEY_PRESS => {
+                let key_press: &KeyPressEvent = unsafe { cast_event(&event) };
+                println!("Key pressed: {}", key_press.detail());
+                check(state.dpy, ungrab_keyboard_checked(state.conn, CURRENT_TIME));
+                let character = key_press_to_ascii(&state.keysyms, key_press);
+                println!("{:?}", character);
+                let image = screenshot(state);
+                save_image("screenshot.png", &image);
+                check(state.dpy, unmap_window_checked(state.conn, state.window));
                 break;
+                // let results = find_chars_list(character);
             }
-            _ => {
-            }
+            _ => {}
         }
     }
-
-    /*
-    unsafe {
-        XUngrabKeyboard(dpy, CurrentTime);
-    } */
 }
 
-fn show_chars(results: Vec<(u32, u32)>) {
-    // XUnmapWindow(dpy, zone);
-    /*
-    for (x, y) in results {
-    } */
+fn screenshot(state: &State) -> xcb_util::image::Image {
+    let planes = unsafe { xlib::XAllPlanes() } as u32;
+    xcb_util::image::get(state.conn, state.window, 200, 200, 200, 200, planes, IMAGE_FORMAT_Z_PIXMAP).unwrap()
 }
 
-fn create_window() {
-}
-
-fn find_chars_list(character: usize) -> Vec<(u32, u32)> {
-    let freetype = freetype::Library::init().unwrap();
-    // let start = PreciseTime::now();
-    let font_face = freetype.new_face("/usr/share/fonts/truetype/hack/Hack-Regular.ttf", 0).unwrap();
-    font_face.set_char_size(14 * 64, 0, 72, 0).unwrap();
-    // TODO: See if TARGET_MONO is better also compare performance.
-    let font_options = face::RENDER;
-    font_face.load_char(character, font_options).unwrap();
-    // let end = PreciseTime::now();
-    let glyph = font_face.glyph();
-    let bitmap = glyph.bitmap();
+fn save_image(path: &str, image: &xcb_util::image::Image) {
+    let buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(image.width() as u32, image.height() as u32, |x, y| {
+        let rgba = image.get(x, y);
+        // TODO: more efficient coercion
+        return Rgba([
+            ((rgba >> 24) & 0xff) as u8,
+            ((rgba >> 16) & 0xff) as u8,
+            ((rgba >> 8) & 0xff) as u8,
+            (rgba & 0xff) as u8,
+        ]);
+    });
     /*
-    let bitvec = BitVec::from_bytes(bitmap.buffer());
-    let charWidth = bitmap.width() as u32;
-    let charHeight = bitmap.rows() as u32;
+    println!("{} {} {} {} {} {}", image.width(), image.height(), image.format(), image.depth(), image.bpp(), image.unit());
+    let buf: ImageBuffer<Rgba<u8>, &[u8]> =
+        ImageBuffer::from_raw(20, 10, image.data()).unwrap();
     */
-    let buffer: ImageBuffer<Luma<u8>, &[u8]> =
-        ImageBuffer::from_raw(bitmap.width() as u32, bitmap.rows() as u32, bitmap.buffer()).unwrap();
-    /*
-    println!("glyph took {} seconds.", start.to(end));
-     */
-    buffer.save(&Path::new("char.png")).unwrap();
+    buf.save(&Path::new(path)).unwrap();
+}
 
-    let mut capturer = Capturer::new(0).unwrap();
-    let mut enigo = Enigo::new();
-    let (w, h) = capturer.geometry();
-    capturer.capture_store_frame().unwrap();
-    let frame = capturer.get_stored_frame().unwrap();
+// FIXME
+//
+// * it needs to have a cookie interface.
+//
+// * Also, why does it have conn in the image?
+//
+// * format finding code in 'create' seems wrong too.
+//
+// * resize function seems iffy.
+//
+// * Ugly that shm::get returns image.
+//
+// TODO: Nice to have a higher level API that takes ownership of Image until get
+// returns, same for other get operations
 
-    images::to_grayscale_threshold(frame, w, h);
-    let results = find_char(bitmap.buffer(), bitmap.width() as u32, bitmap.rows() as u32, frame, w, h);
-    return results;
+/*
+sudo apt-get install libxcb-keysyms1-dev libxcb-image0-dev
+
+xcb-util = { version = "0.2.0", features = ["keysyms", "image", "shm"] }
+*/
+
+/*
+fn screenshot(state: &State) -> shm::Image {
+    // TODO: XCB constant for AllPlanes?
+    let planes = unsafe { xlib::XAllPlanes() } as u32;
+    let depth = 24;
+    // let width = state.cur_screen.width_in_pixels();
+    // let height = state.cur_screen.height_in_pixels();
+    // let (x, y, width, height) = get_screen_dims(state);
+    let x = 200;
+    let y = 200;
+    let width = 200;
+    let height = 200;
+
+    let mut image = shm::create(state.conn, depth, width as u16, height as u16).expect("Failed to allocated shared memory for screenshot");
+    // shm::get(state.conn, state.cur_screen.root(), &mut image, x as i16, y as i16, planes).unwrap();
+    shm::get(state.conn, state.window, &mut image, x as i16, y as i16, 0).unwrap();
+    return image;
+
     /*
-    for (x, y) in results {
-        enigo.mouse_move_to(x as i32, y as i32);
-        break;
-        // thread::sleep(time::Duration::from_millis(100));
+    if image.depth() == 24 && image.bpp() == 32 &&
+       image.height() == height && image.width() == width &&
+       image.scanline_pad() == 0
+        // TODO: check image.byte_order
+        /* TODO x11-cap crate checks these too
+        image.red_mask == 0xFF0000 && image.green_mask == 0xFF00 &&
+        image.blue_mask == 0xFF */ {
+        return image;
+    } else {
+        panic!("X Server yielded screenshot with unexpected format");
     } */
-    /*
-    images::to_grayscale_threshold(frame, w, h);
-    images::jump_to_emacs_cursor(enigo, frame, w, h);
-    */
-}
-
-fn find_char(cbuf: &[u8], cw: u32, ch: u32, buf: &[Bgr8], w: u32, h: u32) -> Vec<(u32, u32)> {
-    let mut found_chars = Vec::new();
-    let thresh = (cw * ch) / 3 * 2;
-    for is_light in [true].iter() {
-        let result = ImageBuffer::from_fn((w - cw) / 2, (h - ch) / 2, |x, y| {
-            let mut acc: u32 = 0;
-            for cx in 0..(cw - 1) {
-                for cy in 0..(ch - 1) {
-                    let screen_val = images::bgr8_to_gray(buf[(x * 2 + cx + (y * 2 + cy) * w) as usize]);
-                    let char_val = cbuf[(cx + cy * cw) as usize];
-                    let in_char = char_val > images::LIGHT_LOWER;
-                    let matches =
-                        if *is_light { (screen_val > images::LIGHT_LOWER) == in_char }
-                        else { (screen_val < images::DARK_UPPER) == in_char };
-                    if matches {
-                        acc += 1;
-                    }
-                }
-            }
-            // println!("result({}, {}) = {}\n {} {} {}", x, y, acc, cw, ch, cw * ch);
-            if acc > thresh {
-                found_chars.push((x * 2, y * 2));
-            }
-            return Luma([if acc > 255 { 255 } else {acc as u8}]);
-        });
-        result.save(&Path::new(if *is_light { "light.png" } else { "dark.png" })).unwrap();
-    }
-    return found_chars;
-}
-
-
-
-/* TODO: Get something like this to work with frame capturing
-
-fn show_time<'a, r>(name: &str, f: &FnOnce() -> &'a r) -> &'a r {
-    use time::PreciseTime;
-    let start = PreciseTime::now();
-    let r = f();
-    let end = PreciseTime::now();
-    println!("{} took {} seconds.", name, start.to(end));
-    return r;
 }
 */
 
-/* Bitvec version
-NOTE: broken if you switch it to some character other than A
+/*
+fn screenshot(state: &State) {
+    let screenshot_cookie =
+        get_image(state.conn,
+                  IMAGE_FORMAT_Z_PIXMAP,
+                  state.cur_screen.root(),
+                  0,
+                  0,
+                  state.cur_screen.width_in_pixels(),
+                  state.cur_screen.height_in_pixels(),
+                  // TODO: XCB constant for AllPlanes?
+                  unsafe { xlib::XAllPlanes() } as u32);
+    // let screenshot_image = check(state.dpy, screenshot_cookie);
+    // FIXME: Check screenshot_image.visual() and .depth(). See
+    // https://xcb.freedesktop.org/xlibtoxcbtranslationguide/#defaultvisualdefaultvisualofscreen
+}
+ */
 
-// TODO: See if TARGET_MONO is better also compare performance.
-let font_options = face::RENDER | face::NO_HINTING | face::MONOCHROME;
-font_face.load_char('A' as usize, font_options).unwrap();
-let end = PreciseTime::now();
-let glyph = font_face.glyph();
-let bitmap = glyph.bitmap();
-let bitvec = BitVec::from_bytes(bitmap.buffer());
-let charWidth = bitmap.width() as u32;
-let charHeight = bitmap.rows() as u32;
-let buffer = ImageBuffer::from_fn(charWidth, charHeight,
-                                  |x, y| Luma([if bitvec[(y * (charWidth / 8 + 1) * 8 + x) as usize] { 0 } else { 255 }]));
-*/
+fn get_screen_dims(state: &State) -> (i32, i32, i32, i32) {
+    // TODO: use xcb instead -
+    // https://stackoverflow.com/questions/22108822/how-do-i-get-the-resolution-of-randr-outputs-through-the-xcb-randr-extension
+    let mon_i = 0;
+    let mut n_mons = 0;
+    let mons = unsafe {
+        xrandr::XRRGetMonitors(state.dpy, state.cur_screen.root() as u64, 1, &mut n_mons)
+    };
+    let mons = unsafe { slice::from_raw_parts_mut(mons, n_mons as usize) };
+    let mon = mons[mon_i];
+    let (x, y, width, height) = (mon.x, mon.y, mon.width, mon.height);
+    println!("{} {} {} {}", x, y, width, height);
+    return (x, y, width, height);
+}

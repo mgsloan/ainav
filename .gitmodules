@@ -1,3 +1,9 @@
 [submodule "x11-rs"]
 	path = x11-rs
-	url = git://github.com/mgsloan/x11-rs.git
+	url = https://github.com/mgsloan/x11-rs
+[submodule "rust-xcb"]
+	path = rust-xcb
+	url = https://github.com/mgsloan/rust-xcb
+[submodule "xcb-util"]
+	path = xcb-util
+	url = https://github.com/meh/rust-xcb-util
